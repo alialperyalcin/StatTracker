@@ -283,10 +283,291 @@ def _extract_lines(image) -> List[OCRLine]:
     return lines
 
 
-def extract_stats(image_path: str) -> Dict[str, int]:
-    _configure_tesseract()
-    preprocessed = _preprocess_image(image_path)
-    lines = _extract_lines(preprocessed)
+def _normalize_anchor(text: str) -> str:
+    return re.sub(r"[^a-z]", "", text.lower())
+
+
+def _is_lord_like(text: str) -> bool:
+    normalized = _normalize_anchor(text)
+    if not normalized:
+        return False
+    if "lord" in normalized:
+        return True
+    return SequenceMatcher(None, normalized, "lord").ratio() >= 0.72
+
+
+def _clean_nickname(text: str) -> str:
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    cleaned = cleaned.strip("|:;,-_ ")
+    return cleaned
+
+
+def _sanitize_nickname_candidate(text: str) -> str:
+    candidate = _clean_nickname(text)
+    if not candidate:
+        return ""
+
+    # Remove leading "Lord" marker if present.
+    candidate = re.sub(r"^lord\b[:\-\s]*", "", candidate, flags=re.IGNORECASE).strip()
+
+    # If OCR merged left profile text with right stat column, cut at stat field phrase.
+    lowered = candidate.lower()
+    cut_idx = len(candidate)
+    for field in CANONICAL_FIELDS:
+        idx = lowered.find(field.lower())
+        if idx != -1 and idx < cut_idx:
+            cut_idx = idx
+    candidate = candidate[:cut_idx]
+
+    # Remove trailing numeric chunk from OCR merges like "<name> 123,456".
+    candidate = re.sub(r"\s*\d[\d,\s]*$", "", candidate)
+    return _clean_nickname(candidate)
+
+
+def _is_likely_stat_label(text: str) -> bool:
+    _, score = _best_field_match(text, CANONICAL_FIELDS)
+    return score >= 0.74
+
+
+def _is_unlikely_nickname(text: str) -> bool:
+    normalized = _normalize_label(text)
+    if not normalized:
+        return True
+
+    words = normalized.split()
+    if len(words) > 4:
+        return True
+
+    blocked = {
+        "power",
+        "merits",
+        "resources",
+        "resource",
+        "info",
+        "units",
+        "killed",
+        "dead",
+        "healed",
+        "gathered",
+        "assistance",
+        "times",
+        "alliance",
+        "help",
+        "more",
+        "total",
+        "gold",
+        "wood",
+        "ore",
+        "mana",
+        "gems",
+    }
+    if any(word in blocked for word in words):
+        return True
+    return False
+
+
+def _extract_nickname_from_lines(lines: List[OCRLine]) -> str | None:
+    for idx, line in enumerate(lines):
+        line_text = line.text.strip()
+        if not line_text:
+            continue
+        if not _is_lord_like(line_text):
+            continue
+
+        # Same-line fallback if OCR merged "Lord <nickname>" into one line.
+        for w_idx, word in enumerate(line.words):
+            if not _is_lord_like(word):
+                continue
+            same_line_nick = _sanitize_nickname_candidate(" ".join(line.words[w_idx + 1 :]))
+            if same_line_nick and same_line_nick.lower() != "lord":
+                if _is_likely_stat_label(same_line_nick):
+                    continue
+                if _is_unlikely_nickname(same_line_nick):
+                    continue
+                return same_line_nick
+
+        # Primary path: nickname is rendered on the line(s) directly below "Lord".
+        for next_line in lines[idx + 1 : idx + 8]:
+            dy = next_line.top - line.bottom
+            # OCR boxes can slightly overlap even when text is visually below.
+            if dy < -35:
+                continue
+            if dy > 220:
+                break
+            if next_line.right < line.left - 120:
+                continue
+            if next_line.left > line.right + 260:
+                continue
+
+            candidate = _sanitize_nickname_candidate(next_line.text)
+            if not candidate:
+                continue
+            if _is_lord_like(candidate):
+                continue
+            if _is_likely_stat_label(candidate):
+                continue
+            if _is_unlikely_nickname(candidate):
+                continue
+            if _line_numeric_only(next_line.words) is not None:
+                continue
+            if not any(ch.isalpha() for ch in candidate):
+                continue
+            return candidate
+
+    return None
+
+
+def _find_power_anchor_line(lines: List[OCRLine]) -> OCRLine | None:
+    best_line = None
+    best_score = 0.0
+    for line in lines:
+        score = _best_single_label_match(line.text, "Power")
+        for word in line.words:
+            word_score = _best_single_label_match(word, "Power")
+            if word_score > score:
+                score = word_score
+        if score > best_score:
+            best_score = score
+            best_line = line
+    if best_score >= 0.72:
+        return best_line
+    return None
+
+
+def _extract_nickname_from_power_anchor(lines: List[OCRLine]) -> str | None:
+    power_line = _find_power_anchor_line(lines)
+    if power_line is None:
+        return None
+
+    candidates: List[Tuple[float, str]] = []
+    for line in lines:
+        if line.bottom >= power_line.top:
+            continue
+        if power_line.top - line.bottom > 280:
+            continue
+        if line.right < power_line.left - 140:
+            continue
+        if line.left > power_line.right + 260:
+            continue
+
+        candidate = _sanitize_nickname_candidate(line.text)
+        if not candidate:
+            continue
+        if _is_lord_like(candidate):
+            continue
+        if _is_likely_stat_label(candidate):
+            continue
+        if _is_unlikely_nickname(candidate):
+            continue
+        if _line_numeric_only(line.words) is not None:
+            continue
+        if not any(ch.isalpha() for ch in candidate):
+            continue
+
+        distance_score = 1.0 - ((power_line.top - line.bottom) / 281.0)
+        text_len_score = min(1.0, len(candidate) / 16.0)
+        score = (distance_score * 0.7) + (text_len_score * 0.3)
+        candidates.append((score, candidate))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def _extract_nickname_from_roi(image_path: str, lines: List[OCRLine]) -> str | None:
+    power_line = _find_power_anchor_line(lines)
+    if power_line is None:
+        return None
+
+    image = cv2.imread(image_path)
+    if image is None:
+        return None
+
+    h, w = image.shape[:2]
+    x1 = max(0, power_line.left - 150)
+    x2 = min(w, power_line.left + 560)
+    y1 = max(0, power_line.top - 360)
+    y2 = max(0, min(h, power_line.top - 10))
+    if x2 - x1 < 80 or y2 - y1 < 50:
+        return None
+
+    roi = image[y1:y2, x1:x2]
+    roi = cv2.resize(roi, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    th = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 12
+    )
+
+    variants = [gray, th]
+    configs = ["--oem 3 --psm 6", "--oem 3 --psm 11"]
+
+    for variant in variants:
+        for cfg in configs:
+            text = pytesseract.image_to_string(variant, config=cfg)
+            lines_text = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            if not lines_text:
+                continue
+
+            for idx, raw in enumerate(lines_text):
+                if not _is_lord_like(raw):
+                    continue
+
+                # If OCR merges "Lord Saint Angel" on one line, keep text after Lord.
+                words = raw.split()
+                for w_idx, word in enumerate(words):
+                    if not _is_lord_like(word):
+                        continue
+                    merged = _sanitize_nickname_candidate(" ".join(words[w_idx + 1 :]))
+                    if merged and merged.lower() != "lord":
+                        if _is_likely_stat_label(merged):
+                            continue
+                        if _is_unlikely_nickname(merged):
+                            continue
+                        return merged
+
+                # Otherwise take the first clean line below "Lord".
+                for next_raw in lines_text[idx + 1 : idx + 5]:
+                    candidate = _sanitize_nickname_candidate(next_raw)
+                    if not candidate:
+                        continue
+                    if _is_lord_like(candidate):
+                        continue
+                    if _is_likely_stat_label(candidate):
+                        continue
+                    if _is_unlikely_nickname(candidate):
+                        continue
+                    if _parse_numeric(candidate) is not None:
+                        continue
+                    if not any(ch.isalpha() for ch in candidate):
+                        continue
+                    return candidate
+
+            # Fallback: choose strongest name-like line in ROI when "Lord" was missed.
+            roi_candidates: List[str] = []
+            for raw in lines_text:
+                candidate = _sanitize_nickname_candidate(raw)
+                if not candidate:
+                    continue
+                if _is_lord_like(candidate):
+                    continue
+                if _is_likely_stat_label(candidate):
+                    continue
+                if _is_unlikely_nickname(candidate):
+                    continue
+                if _parse_numeric(candidate) is not None:
+                    continue
+                if not any(ch.isalpha() for ch in candidate):
+                    continue
+                roi_candidates.append(candidate)
+            if roi_candidates:
+                roi_candidates.sort(key=lambda s: len(s), reverse=True)
+                return roi_candidates[0]
+
+    return None
+
+
+def _extract_stats_from_lines(lines: List[OCRLine], image_path: str) -> Dict[str, int]:
 
     # Keep the best value per field by quality score.
     result: Dict[str, int] = {}
@@ -383,3 +664,26 @@ def extract_stats(image_path: str) -> Dict[str, int]:
                 assign(key, fallback[key], 10.0)
 
     return result
+
+
+def extract_stats_and_nickname(image_path: str) -> Tuple[Dict[str, int], str | None]:
+    _configure_tesseract()
+    preprocessed = _preprocess_image(image_path)
+    lines = _extract_lines(preprocessed)
+    stats = _extract_stats_from_lines(lines, image_path)
+    nickname = _extract_nickname_from_lines(lines)
+    if not nickname:
+        nickname = _extract_nickname_from_power_anchor(lines)
+    if not nickname:
+        nickname = _extract_nickname_from_roi(image_path, lines)
+    return stats, nickname
+
+
+def extract_stats(image_path: str) -> Dict[str, int]:
+    stats, _ = extract_stats_and_nickname(image_path)
+    return stats
+
+
+def extract_nickname(image_path: str) -> str | None:
+    _, nickname = extract_stats_and_nickname(image_path)
+    return nickname

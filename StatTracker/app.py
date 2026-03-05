@@ -10,7 +10,7 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageGrab, ImageTk
 
 from excel_writer import ExcelFileLockedError, append_stats
-from stat_extractor import CANONICAL_FIELDS, extract_stats
+from stat_extractor import CANONICAL_FIELDS, extract_nickname, extract_stats_and_nickname
 
 
 COLORS = {
@@ -46,6 +46,7 @@ class StatTrackerApp(tk.Tk):
         self.session_active = False
         self.capture_in_progress = False
         self.saved_rows = 0
+        self.current_nickname: str | None = None
         self.window_title_var = tk.StringVar()
         self.value_vars = {field: tk.StringVar() for field in CANONICAL_FIELDS}
 
@@ -296,6 +297,7 @@ class StatTrackerApp(tk.Tk):
             return
 
         self.selected_image = path
+        self.current_nickname = None
         self.image_info_var.set(f"Screenshot: {path}")
         self._show_preview(path)
         self.status_var.set("Screenshot selected. Click 'Extract Stats'.")
@@ -321,6 +323,7 @@ class StatTrackerApp(tk.Tk):
     def clear_fields(self) -> None:
         for var in self.value_vars.values():
             var.set("")
+        self.current_nickname = None
         self.status_var.set("Fields cleared.")
 
     def extract(self) -> None:
@@ -331,12 +334,13 @@ class StatTrackerApp(tk.Tk):
         self._apply_tesseract_path()
 
         try:
-            data = extract_stats(self.selected_image)
+            data, nickname = extract_stats_and_nickname(self.selected_image)
         except Exception as exc:
             messagebox.showerror("Extraction failed", str(exc))
             self.status_var.set("Extraction failed.")
             return
 
+        self.current_nickname = nickname
         for field in CANONICAL_FIELDS:
             value = data.get(field)
             self.value_vars[field].set("" if value is None else str(value))
@@ -453,15 +457,16 @@ class StatTrackerApp(tk.Tk):
         try:
             image_path = self._grab_active_window_image()
             self.selected_image = image_path
-            data = extract_stats(image_path)
+            data, nickname = extract_stats_and_nickname(image_path)
+            self.current_nickname = nickname
 
             if not self._looks_like_profile_stats(data):
                 self._safe_status("Current window did not match profile stats layout.")
                 return
 
-            append_stats(self.excel_path, data, image_path)
+            append_stats(self.excel_path, data, image_path, nickname=nickname)
             self.saved_rows += 1
-            self.after(0, lambda: self._apply_extracted_ui(image_path, data))
+            self.after(0, lambda: self._apply_extracted_ui(image_path, data, nickname))
             self._safe_status(
                 f"Saved row #{self.saved_rows}. Keep browsing profiles and press F8 again."
             )
@@ -511,8 +516,9 @@ class StatTrackerApp(tk.Tk):
         screenshot.save(image_path)
         return str(image_path)
 
-    def _apply_extracted_ui(self, image_path: str, data: dict) -> None:
+    def _apply_extracted_ui(self, image_path: str, data: dict, nickname: str | None = None) -> None:
         self.image_info_var.set(f"Screenshot: {image_path}")
+        self.current_nickname = nickname
         self._show_preview(image_path)
         for field in CANONICAL_FIELDS:
             value = data.get(field)
@@ -539,10 +545,12 @@ class StatTrackerApp(tk.Tk):
             screenshot = ImageGrab.grab(all_screens=True)
             screenshot.save(image_path)
             self.selected_image = str(image_path)
+            self.current_nickname = None
             self.image_info_var.set(f"Screenshot: {self.selected_image}")
             self._show_preview(self.selected_image)
 
-            data = extract_stats(self.selected_image)
+            data, nickname = extract_stats_and_nickname(self.selected_image)
+            self.current_nickname = nickname
             for field in CANONICAL_FIELDS:
                 value = data.get(field)
                 self.value_vars[field].set("" if value is None else str(value))
@@ -556,7 +564,7 @@ class StatTrackerApp(tk.Tk):
                 )
                 return
 
-            append_stats(self.excel_path, data, self.selected_image)
+            append_stats(self.excel_path, data, self.selected_image, nickname=nickname)
         except ExcelFileLockedError as exc:
             messagebox.showwarning("Excel file is locked", str(exc))
             self.status_var.set("Excel file is locked. Close it and retry.")
@@ -581,7 +589,11 @@ class StatTrackerApp(tk.Tk):
         try:
             self._apply_tesseract_path()
             stats = self._read_current_stats()
-            append_stats(self.excel_path, stats, self.selected_image)
+            nickname = self.current_nickname
+            if nickname is None and self.selected_image:
+                nickname = extract_nickname(self.selected_image)
+                self.current_nickname = nickname
+            append_stats(self.excel_path, stats, self.selected_image, nickname=nickname)
         except ExcelFileLockedError as exc:
             messagebox.showwarning("Excel file is locked", str(exc))
             self.status_var.set("Excel file is locked. Close it and retry.")

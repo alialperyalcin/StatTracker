@@ -80,6 +80,7 @@ Use these if you do not want hotkeys.
 ## Output
 
 - Excel rows include:
+  - nickname (under `Lord` in profile)
   - timestamp
   - captured image filename
   - extracted stat fields

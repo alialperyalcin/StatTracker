@@ -10,7 +10,8 @@ from openpyxl import Workbook, load_workbook
 from stat_extractor import CANONICAL_FIELDS
 
 
-HEADER: List[str] = ["Timestamp", "Image File", *CANONICAL_FIELDS]
+OLD_HEADER: List[str] = ["Timestamp", "Image File", *CANONICAL_FIELDS]
+HEADER: List[str] = ["Nickname", "Timestamp", "Image File", *CANONICAL_FIELDS]
 
 
 class ExcelFileLockedError(RuntimeError):
@@ -26,7 +27,10 @@ def _ensure_workbook(path: str):
                 ws.append(HEADER)
             else:
                 first_row = [cell.value for cell in ws[1]]
-                if first_row != HEADER:
+                if first_row == OLD_HEADER:
+                    ws.insert_cols(1)
+                    ws.cell(row=1, column=1, value="Nickname")
+                elif first_row != HEADER:
                     ws.insert_rows(1)
                     for idx, name in enumerate(HEADER, start=1):
                         ws.cell(row=1, column=idx, value=name)
@@ -58,10 +62,14 @@ def _save_with_retry(wb: Workbook, path: str, retries: int = 5, wait_sec: float 
     ) from last_exc
 
 
-def append_stats(path: str, stats: Dict[str, int], image_file: str) -> None:
+def append_stats(path: str, stats: Dict[str, int], image_file: str, nickname: str | None = None) -> None:
     wb, ws = _ensure_workbook(path)
 
-    row = [datetime.now().strftime("%Y-%m-%d %H:%M:%S"), os.path.basename(image_file)]
+    row = [
+        (nickname or "").strip(),
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        os.path.basename(image_file),
+    ]
     for key in CANONICAL_FIELDS:
         row.append(stats.get(key))
     ws.append(row)
